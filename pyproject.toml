@@ -1,0 +1,12 @@
+[project]
+name = "mudhub"
+version = "0.1.0"
+description = "Three-way MUD hub enabling conversation between User, MUD, and LLM"
+requires-python = ">=3.12"
+dependencies = [
+    "telnetlib3>=2.0.8",
+    "llm>=0.17",
+]
+
+[project.scripts]
+mudhub = "main:main"
