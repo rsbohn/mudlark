@@ -7,6 +7,7 @@ A text-routing hub enabling conversation between User, MUD, and LLM.
 import asyncio
 import sys
 import os
+import csv
 from typing import Optional, List, Dict
 from collections import deque
 from telnetlib3 import open_connection
@@ -41,8 +42,12 @@ class MUDHub:
         
         self.proposals: Dict[int, Proposal] = {}
         self.transcript: deque = deque(maxlen=1000)
+        self.mudlist: Dict[str, Dict[str, str]] = {}
         
         self.running = False
+        
+        # Load MUD list
+        self.load_mudlist()
         
         # Initialize LLM model
         try:
@@ -52,13 +57,35 @@ class MUDHub:
             self.model = None
             self.llm_enabled = False
     
-    async def connect_mud(self):
+    def load_mudlist(self):
+        """Load MUD list from mudlist.csv."""
+        try:
+            with open('mudlist.csv', 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    name = row['name'].strip()
+                    self.mudlist[name] = {
+                        'host': row['address'].strip(),
+                        'port': int(row['port'].strip())
+                    }
+        except FileNotFoundError:
+            print("[HUB] Warning: mudlist.csv not found", file=sys.stderr)
+        except Exception as e:
+            print(f"[HUB] Warning: Error loading mudlist.csv: {e}", file=sys.stderr)
+    
+    async def connect_mud(self, host: Optional[str] = None, port: Optional[int] = None):
         """Establish telnet connection to MUD."""
+        # Use provided host/port or fall back to instance variables
+        connect_host = host or self.mud_host
+        connect_port = port or self.mud_port
+        
         try:
             self.mud_reader, self.mud_writer = await open_connection(
-                self.mud_host, self.mud_port
+                connect_host, connect_port
             )
-            self.log_transcript(f"[HUB] Connected to {self.mud_host}:{self.mud_port}")
+            self.mud_host = connect_host
+            self.mud_port = connect_port
+            self.log_transcript(f"[HUB] Connected to {connect_host}:{connect_port}")
             return True
         except Exception as e:
             print(f"[HUB ERROR] Failed to connect to MUD: {e}", file=sys.stderr)
@@ -185,6 +212,10 @@ class MUDHub:
                 except ValueError:
                     print("[HUB] Invalid proposal ID", file=sys.stderr)
         
+        elif command.startswith('[dial '):
+            mud_name = command[6:-1].strip() if command.endswith(']') else command[6:].strip()
+            await self.dial_mud(mud_name)
+        
         elif command.startswith('[llm '):
             state = command[5:-1].strip() if command.endswith(']') else command[5:].strip()
             if state == 'on':
@@ -215,6 +246,7 @@ class MUDHub:
   [approve N]    - Send proposal N to the MUD
   [reject N]     - Discard proposal N
   [reject all]   - Discard all proposals
+  [dial <name>]  - Connect to MUD from mudlist.csv
   [llm on|off|info] - Toggle LLM observation or show LLM info
   [quit]         - Exit the hub (also: [q], [exit])
   
@@ -266,6 +298,33 @@ User input routing:
         count = len(self.proposals)
         self.proposals.clear()
         print(f"[HUB] Rejected all {count} proposal(s)")
+    
+    async def dial_mud(self, mud_name: str):
+        """Connect to a MUD from the mudlist."""
+        # Check if already connected
+        if self.mud_writer and not self.local_mode:
+            print("[HUB] Unable to comply.")
+            return
+        
+        # Look up MUD in mudlist
+        if mud_name not in self.mudlist:
+            print(f"[HUB] MUD '{mud_name}' not found in mudlist.csv", file=sys.stderr)
+            return
+        
+        mud_info = self.mudlist[mud_name]
+        host = mud_info['host']
+        port = mud_info['port']
+        
+        print(f"[HUB] Dialing {mud_name} at {host}:{port}...")
+        
+        # If in local mode, exit it and start MUD connection
+        if self.local_mode:
+            self.local_mode = False
+            if await self.connect_mud(host, port):
+                # Start the MUD reader loop
+                asyncio.create_task(self.mud_reader_loop())
+        else:
+            await self.connect_mud(host, port)
     
     def show_llm_info(self):
         """Display LLM model and status information."""
