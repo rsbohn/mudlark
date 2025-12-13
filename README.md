@@ -41,6 +41,22 @@ uv run mudhub --local
 
 In local mode, all user input (except hub commands) is sent directly to the LLM.
 
+### Quick Fake MUD for Testing
+
+You can spin up a tiny fake MUD using `socat` and `fake_mud.py`:
+
+```bash
+# In one terminal (requires socat installed)
+chmod +x fake_mud.py
+socat -v TCP-LISTEN:4000,reuseaddr,fork EXEC:"./fake_mud.py"
+# If socat can't find python on PATH, use: EXEC:"/usr/bin/env python3 fake_mud.py"
+
+# In another terminal, run mudhub against it
+uv run main.py localhost 4000
+```
+
+Sending movement commands like `n/s/e/w` will rotate between a couple of room descriptions so you can test location detection, quiet/trace toggles, and LLM proposals without a live MUD.
+
 ## User Interface
 
 ### Input Routing
