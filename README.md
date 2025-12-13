@@ -1,4 +1,4 @@
-# MUD Hub
+# Mudlark
 
 A three-way text-routing hub enabling conversation between User, MUD, and LLM.
 
@@ -20,7 +20,7 @@ uv run main.py <mud_host> <mud_port>
 
 Or use the script entry point:
 ```bash
-uv run mudhub <mud_host> <mud_port>
+uv run mudlark <mud_host> <mud_port>
 ```
 
 Example:
@@ -36,7 +36,7 @@ uv run main.py --local
 
 Or:
 ```bash
-uv run mudhub --local
+uv run mudlark --local
 ```
 
 In local mode, all user input (except hub commands) is sent directly to the LLM.
@@ -51,7 +51,7 @@ chmod +x fake_mud.py
 socat -v TCP-LISTEN:4000,reuseaddr,fork EXEC:"./fake_mud.py"
 # If socat can't find python on PATH, use: EXEC:"/usr/bin/env python3 fake_mud.py"
 
-# In another terminal, run mudhub against it
+# In another terminal, run Mudlark against it
 uv run main.py localhost 4000
 ```
 

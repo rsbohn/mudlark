@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Tiny fake MUD responder for testing mudhub.
+Tiny fake MUD responder for testing Mudlark.
 
 Run with socat, e.g.:
   socat -v TCP-LISTEN:4000,reuseaddr,fork EXEC:"python fake_mud.py"
-Then connect mudhub to localhost 4000:
+Then connect Mudlark to localhost 4000:
   uv run main.py localhost 4000
 """
 

@@ -1,5 +1,5 @@
 [project]
-name = "mudhub"
+name = "mudlark"
 version = "0.1.0"
 description = "Three-way MUD hub enabling conversation between User, MUD, and LLM"
 requires-python = ">=3.12"
@@ -9,4 +9,4 @@ dependencies = [
 ]
 
 [project.scripts]
-mudhub = "main:main"
+mudlark = "main:main"

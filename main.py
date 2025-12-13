@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Three-Way MUD Hub (Codex)
-A text-routing hub enabling conversation between User, MUD, and LLM.
+Mudlark (Codex)
+A three-way text-routing hub enabling conversation between User, MUD, and LLM.
 """
 
 import asyncio
@@ -256,7 +256,7 @@ class MUDHub:
             if not note_text:
                 print("[HUB] Usage: [note <text>]", file=sys.stderr)
                 return
-            self.append_to_bambu(note_text)
+            self.append_to_bambu(f"[note]{note_text}")
             print("[HUB] Note appended to bambu.log")
         
         elif command.startswith('[llm '):
@@ -596,7 +596,7 @@ Only suggest MUD commands, never execute them directly."""
             if await self.connect_mud():
                 # Start MUD reader loop as background task
                 asyncio.create_task(self.mud_reader_loop())
-            print("[HUB] MUD Hub started. Type [help] for commands.")
+            print("[HUB] Mudlark started. Type [help] for commands.")
         
         # Mark start of session in log
         self.log_session_start()
