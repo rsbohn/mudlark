@@ -119,7 +119,15 @@ class MUDHub:
         except Exception as e:
             print(f"\n[HUB ERROR] MUD reader error: {e}", file=sys.stderr)
         finally:
-            self.running = False
+            # Clean up connection but keep hub running
+            if self.mud_writer:
+                self.mud_writer.close()
+                try:
+                    await self.mud_writer.wait_closed()
+                except:
+                    pass
+            self.mud_reader = None
+            self.mud_writer = None
     
     async def user_input_loop(self):
         """Read from stdin and route based on prefix."""
@@ -303,7 +311,7 @@ User input routing:
         """Connect to a MUD from the mudlist."""
         # Check if already connected
         if self.mud_writer and not self.local_mode:
-            print("[HUB] Unable to comply.")
+            print("[HUB] Already connected. Disconnect first.")
             return
         
         # Look up MUD in mudlist
@@ -320,11 +328,10 @@ User input routing:
         # If in local mode, exit it and start MUD connection
         if self.local_mode:
             self.local_mode = False
-            if await self.connect_mud(host, port):
-                # Start the MUD reader loop
-                asyncio.create_task(self.mud_reader_loop())
-        else:
-            await self.connect_mud(host, port)
+        
+        if await self.connect_mud(host, port):
+            # Start the MUD reader loop
+            asyncio.create_task(self.mud_reader_loop())
     
     def show_llm_info(self):
         """Display LLM model and status information."""
@@ -407,36 +414,36 @@ Only suggest MUD commands, never execute them directly."""
                 # Treat unprefixed lines as NOTE
                 print(f"[LLM] {line}")
     
-    def get_context(self) -> str:
+    def get_context(self, max_lines: int = 50) -> str:
         """Get recent transcript for LLM context."""
-        return '\n'.join(self.transcript)
+        # Get only the most recent messages to avoid stale context
+        recent = list(self.transcript)[-max_lines:]
+        return '\n'.join(recent)
     
     async def run(self):
         """Main event loop."""
+        self.running = True
+        
         if self.local_mode:
             print("[HUB] Local mode - LLM only. Type [help] for commands.")
-            self.running = True
         else:
-            if not await self.connect_mud():
-                return
-            self.running = True
+            if await self.connect_mud():
+                # Start MUD reader loop as background task
+                asyncio.create_task(self.mud_reader_loop())
             print("[HUB] MUD Hub started. Type [help] for commands.")
         
         try:
-            # Run loops concurrently (only mud_reader_loop if not in local mode)
-            if self.local_mode:
-                await self.user_input_loop()
-            else:
-                await asyncio.gather(
-                    self.mud_reader_loop(),
-                    self.user_input_loop()
-                )
+            # User input loop runs until explicit quit
+            await self.user_input_loop()
         except KeyboardInterrupt:
             print("\n[HUB] Shutting down...")
         finally:
             if self.mud_writer:
                 self.mud_writer.close()
-                await self.mud_writer.wait_closed()
+                try:
+                    await self.mud_writer.wait_closed()
+                except:
+                    pass
     
     async def shutdown(self):
         """Clean shutdown."""
@@ -451,8 +458,31 @@ def main():
         asyncio.run(hub.run())
         return
     
+    if len(sys.argv) < 2:
+        print("Usage: uv run main.py @<mud_name>")
+        print("   or: uv run main.py <mud_host> <mud_port>")
+        print("   or: uv run main.py --local")
+        sys.exit(1)
+    
+    # Check if first argument is @mudname format
+    if sys.argv[1].startswith('@'):
+        mud_name = sys.argv[1][1:]  # Remove @ prefix
+        hub = MUDHub(local_mode=True)  # Start in local mode
+        # Load the mudlist to validate
+        if mud_name not in hub.mudlist:
+            print(f"Error: MUD '{mud_name}' not found in mudlist.csv")
+            sys.exit(1)
+        # Set the initial MUD to dial
+        mud_info = hub.mudlist[mud_name]
+        hub.mud_host = mud_info['host']
+        hub.mud_port = mud_info['port']
+        hub.local_mode = False
+        asyncio.run(hub.run())
+        return
+    
     if len(sys.argv) < 3:
-        print("Usage: uv run main.py <mud_host> <mud_port>")
+        print("Usage: uv run main.py @<mud_name>")
+        print("   or: uv run main.py <mud_host> <mud_port>")
         print("   or: uv run main.py --local")
         sys.exit(1)
     
