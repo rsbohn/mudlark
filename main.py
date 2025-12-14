@@ -8,6 +8,9 @@ import asyncio
 import sys
 import os
 import csv
+import re
+import json
+from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict
 from collections import deque
@@ -30,13 +33,14 @@ class Proposal:
 
 class MUDHub:
     """Central hub managing three-way communication."""
-    
-    def __init__(self, mud_host: Optional[str] = None, mud_port: Optional[int] = None, llm_enabled: bool = True, local_mode: bool = False, llm_model: str = "gpt-4o-mini"):
+
+    def __init__(self, mud_host: Optional[str] = None, mud_port: Optional[int] = None, llm_enabled: bool = True, local_mode: bool = False, llm_model: str = "gpt-4o-mini", mapping_enabled: bool = False):
         self.mud_host = mud_host
         self.mud_port = mud_port
         self.llm_enabled = llm_enabled
         self.local_mode = local_mode
         self.llm_model = llm_model
+        self.mapping_enabled = mapping_enabled
         
         self.mud_reader: Optional[asyncio.StreamReader] = None
         self.mud_writer: Optional[asyncio.StreamWriter] = None
@@ -46,16 +50,32 @@ class MUDHub:
         self.mudlist: Dict[str, Dict[str, str]] = {}
         self.current_location: Optional[str] = None
         self.location_block: List[str] = []  # holds recent lines to detect room changes
+        self.pending_room_header: Optional[str] = None  # first header candidate before exits
         self.location_task: Optional[asyncio.Task] = None
         self.location_llm_delay: float = 0.6
         self.awaiting_room_header: bool = True
         self.llm_quiet: bool = False
         self.llm_trace: bool = False
+        self.last_move_dir: Optional[str] = None
+        self.map_path: Path = Path("mudmap.json")
+        self.map_data: Dict = {"rooms": {}}
+        self.directions = {"n", "s", "e", "w", "u", "d", "ne", "nw", "se", "sw",
+                           "north", "south", "east", "west", "up", "down", "in", "out"}
+        self.dir_aliases = {
+            "north": "n", "south": "s", "east": "e", "west": "w",
+            "up": "u", "down": "d",
+            "northeast": "ne", "northwest": "nw",
+            "southeast": "se", "southwest": "sw",
+            "in": "in", "out": "out"
+        }
         
         self.running = False
         
         # Load MUD list
         self.load_mudlist()
+
+        if self.mapping_enabled:
+            self.load_map()
         
         # Initialize LLM model
         try:
@@ -64,6 +84,18 @@ class MUDHub:
             print(f"[HUB] Warning: Could not load LLM model '{self.llm_model}': {e}", file=sys.stderr)
             self.model = None
             self.llm_enabled = False
+
+    @staticmethod
+    def strip_ansi(text: str) -> str:
+        """Remove ANSI color codes."""
+        ansi_re = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+        return ansi_re.sub("", text)
+
+    @staticmethod
+    def clean_line(text: str) -> str:
+        """Normalize a line for detection (strip ANSI + collapse whitespace)."""
+        no_ansi = MUDHub.strip_ansi(text)
+        return " ".join(no_ansi.split())
     
     def load_mudlist(self):
         """Load MUD list from mudlist.csv."""
@@ -111,6 +143,44 @@ class MUDHub:
                 f.write(f"[{ts}] {line}\n")
         except Exception as e:
             print(f"[HUB] Failed to write to bambu.log: {e}", file=sys.stderr)
+
+    # --- Mapping helpers ---
+    def load_map(self):
+        """Load existing mudmap.json if present."""
+        try:
+            if self.map_path.exists():
+                self.map_data = json.loads(self.map_path.read_text())
+                if "rooms" not in self.map_data:
+                    self.map_data = {"rooms": {}}
+        except Exception as e:
+            print(f"[HUB] Warning: could not load mudmap.json: {e}", file=sys.stderr)
+            self.map_data = {"rooms": {}}
+
+    def save_map(self):
+        """Persist map to mudmap.json (best-effort)."""
+        try:
+            self.map_path.write_text(json.dumps(self.map_data, indent=2, sort_keys=True))
+        except Exception as e:
+            print(f"[HUB] Warning: could not save mudmap.json: {e}", file=sys.stderr)
+
+    def record_transition(self, origin: str, direction: str, dest: str):
+        """Record a directional edge between rooms."""
+        rooms = self.map_data.setdefault("rooms", {})
+        origin_entry = rooms.setdefault(origin, {"exits": {}})
+        dest_entry = rooms.setdefault(dest, {"exits": {}})
+        origin_entry["exits"][direction] = dest
+        rooms[origin] = origin_entry
+        rooms[dest] = dest_entry
+        self.save_map()
+
+    def register_move_command(self, message: str):
+        """Track the last movement command to build the map."""
+        cmd = message.strip().lower()
+        if cmd in self.directions:
+            self.last_move_dir = self.dir_aliases.get(cmd, cmd)
+        else:
+            # Clear so non-movement doesn't get mapped
+            self.last_move_dir = None
 
     def log_session_start(self):
         """Log a session boundary to bambu.log."""
@@ -201,6 +271,8 @@ class MUDHub:
                         self.log_transcript(f"[USER->LLM] {line}")
                         await self.llm_query(line)
                     else:
+                        if self.mapping_enabled:
+                            self.register_move_command(line)
                         await self.send_to_mud(line)
                         self.log_transcript(f"[USER->MUD] {line}")
                     
@@ -392,15 +464,19 @@ User input routing:
     def process_location_detection(self, text: str):
         """Heuristically detect room changes from MUD output and auto-ping the LLM."""
         for raw_line in text.splitlines():
-            line = raw_line.rstrip('\r')
+            line = self.clean_line(raw_line.rstrip('\r'))
+            if not line:
+                continue
+
             if self.awaiting_room_header:
-                stripped = line.strip()
-                if self.is_prompt_line(stripped) or stripped.startswith('<'):
+                if self.is_prompt_line(line) or line.startswith('<'):
                     # Ignore prompts while waiting for the next header
                     self.location_block.clear()
                     self.awaiting_room_header = True
+                    self.pending_room_header = None
                 elif self.is_room_header(line):
                     self.location_block = [line]
+                    self.pending_room_header = line
                     self.awaiting_room_header = False
                 continue
 
@@ -410,15 +486,23 @@ User input routing:
                 self.location_block = self.location_block[-80:]
 
             if 'obvious exits' in line.lower():
-                room_name = self.extract_room_name(self.location_block)
+                room_name = None
+                if self.pending_room_header and self.is_room_header(self.pending_room_header):
+                    room_name = self.pending_room_header
+                else:
+                    room_name = self.extract_room_name(self.location_block)
                 self.location_block.clear()
+                self.pending_room_header = None
                 self.awaiting_room_header = True
 
                 if room_name and room_name != self.current_location:
+                    prev_location = self.current_location
                     self.current_location = room_name
+                    if self.mapping_enabled and prev_location and self.last_move_dir:
+                        self.record_transition(prev_location, self.last_move_dir, room_name)
+                    self.last_move_dir = None
                     self.append_to_bambu(f"[location]{room_name}")
                     if not self.llm_quiet:
-                        print(f"[HUB] New location detected: {room_name} (LLM in {self.location_llm_delay:.1f}s)")
                         self.schedule_location_llm(room_name)
 
     def extract_room_name(self, lines: List[str]) -> Optional[str]:
@@ -438,24 +522,60 @@ User input routing:
 
     def is_room_header(self, line: str) -> bool:
         """Check if a line looks like a room name."""
-        stripped = line.strip()
+        stripped = self.clean_line(line)
         if not stripped:
+            return False
+        if not stripped[0].isalpha() or not stripped[0].isupper():
             return False
         if self.is_prompt_line(stripped):
             return False
         if '<' in stripped or '>' in stripped:
             return False
-        if line[:1].isspace():
+        if '. ' in stripped:
             return False
-        if stripped.endswith('.'):
+        if stripped.startswith("You "):
             return False
-        if ' says ' in stripped.lower():
+        if any(ch in stripped for ch in ("'", '"', "(")):
+            return False
+        if stripped[-1] in {'.', '!', '?'}:
+            return False
+        if stripped[:1].isspace():
+            return False
+        lower = stripped.lower()
+        if ' says ' in lower or ' asks ' in lower or ' tells ' in lower:
+            return False
+        if any(pat in lower for pat in (' shouts ', 'chat', 'auction', 'gossip', 'ooc', 'clan', 'newbie')):
+            return False
+        if 'name race level class' in lower:
             return False
         # Heuristic: room headers usually don't contain ':' (exit lines do)
         if ':' in stripped:
             return False
         if stripped.lower() in {'n', 's', 'e', 'w', 'u', 'd', 'ne', 'nw', 'se', 'sw', 'in', 'out', 'look', 'l'}:
             return False
+        if any(ch.isdigit() for ch in stripped):
+            return False
+
+        tokens = stripped.split()
+        if not tokens:
+            return False
+        if len(tokens) > 10:
+            return False
+        # Reject if the majority of tokens start lowercase (likely a sentence/description)
+        lower_initial = sum(1 for tok in tokens if tok[0].islower())
+        if len(tokens) > 1 and lower_initial > len(tokens) / 2:
+            return False
+
+        # Reject loud uppercase banners (allow short 1-3 word uppercase names)
+        upper_tokens = [tok for tok in tokens if tok.isupper() and len(tok) > 1]
+        if upper_tokens and len(tokens) > 3 and len(upper_tokens) == len(tokens):
+            return False
+
+        # Require at least one token that looks Title Case (starts upper, has lowercase)
+        title_like = any(tok[0].isupper() and any(c.islower() for c in tok[1:]) for tok in tokens)
+        if not title_like:
+            return False
+
         return True
 
     def is_prompt_line(self, line: str) -> bool:
@@ -621,22 +741,25 @@ Only suggest MUD commands, never execute them directly."""
 
 def main():
     """Entry point."""
+    args = [a for a in sys.argv[1:] if a != '--mapping']
+    mapping_enabled = '--mapping' in sys.argv[1:]
+
     # Check for --local flag
-    if '--local' in sys.argv:
-        hub = MUDHub(local_mode=True)
+    if '--local' in args:
+        hub = MUDHub(local_mode=True, mapping_enabled=mapping_enabled)
         asyncio.run(hub.run())
         return
     
-    if len(sys.argv) < 2:
-        print("Usage: uv run main.py @<mud_name>")
-        print("   or: uv run main.py <mud_host> <mud_port>")
-        print("   or: uv run main.py --local")
+    if len(args) < 1:
+        print("Usage: uv run main.py [--mapping] @<mud_name>")
+        print("   or: uv run main.py [--mapping] <mud_host> <mud_port>")
+        print("   or: uv run main.py [--mapping] --local")
         sys.exit(1)
     
     # Check if first argument is @mudname format
-    if sys.argv[1].startswith('@'):
-        mud_name = sys.argv[1][1:]  # Remove @ prefix
-        hub = MUDHub(local_mode=True)  # Start in local mode
+    if args[0].startswith('@'):
+        mud_name = args[0][1:]  # Remove @ prefix
+        hub = MUDHub(local_mode=True, mapping_enabled=mapping_enabled)  # Start in local mode
         # Load the mudlist to validate
         if mud_name not in hub.mudlist:
             print(f"Error: MUD '{mud_name}' not found in mudlist.csv")
@@ -649,20 +772,20 @@ def main():
         asyncio.run(hub.run())
         return
     
-    if len(sys.argv) < 3:
-        print("Usage: uv run main.py @<mud_name>")
-        print("   or: uv run main.py <mud_host> <mud_port>")
-        print("   or: uv run main.py --local")
+    if len(args) < 2:
+        print("Usage: uv run main.py [--mapping] @<mud_name>")
+        print("   or: uv run main.py [--mapping] <mud_host> <mud_port>")
+        print("   or: uv run main.py [--mapping] --local")
         sys.exit(1)
     
-    mud_host = sys.argv[1]
+    mud_host = args[0]
     try:
-        mud_port = int(sys.argv[2])
+        mud_port = int(args[1])
     except ValueError:
         print("Error: Port must be a number")
         sys.exit(1)
     
-    hub = MUDHub(mud_host, mud_port)
+    hub = MUDHub(mud_host, mud_port, mapping_enabled=mapping_enabled)
     asyncio.run(hub.run())
 
 

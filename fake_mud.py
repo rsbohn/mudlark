@@ -49,6 +49,16 @@ def main() -> None:
             sys.stdout.write("Goodbye!\r\n")
             sys.stdout.flush()
             break
+        if cmd in {"score", "sc"}:
+            # Minimal fake score output
+            sys.stdout.write(
+                "You are Bambu the Tester.\r\n"
+                "Level: 10  Class: Explorer  Race: Human\r\n"
+                "HP: 56/60  Mana: 110/120  Moves: 109/120  Exp: 12345\r\n"
+                "Gold: 101\r\n"
+            )
+            sys.stdout.flush()
+            continue
         if cmd in {"n", "s", "e", "w", "u", "d", "ne", "nw", "se", "sw", "look", "l", ""}:
             idx = (idx + 1) % len(ROOMS)
             send_room(idx)
