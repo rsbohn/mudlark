@@ -9,12 +9,18 @@ import sys
 import os
 import csv
 import re
-import json
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict
 from collections import deque
 from telnetlib3 import open_connection
+
+ROOT = Path(__file__).resolve().parent
+SRC_DIR = ROOT / "src"
+if SRC_DIR.exists():
+    sys.path.append(str(SRC_DIR))
+
+from mudlark.mapping import Mapper  # type: ignore
 import llm
 
 
@@ -41,6 +47,7 @@ class MUDHub:
         self.local_mode = local_mode
         self.llm_model = llm_model
         self.mapping_enabled = mapping_enabled
+        self.mapper: Optional[Mapper] = Mapper() if mapping_enabled else None
         
         self.mud_reader: Optional[asyncio.StreamReader] = None
         self.mud_writer: Optional[asyncio.StreamWriter] = None
@@ -56,26 +63,11 @@ class MUDHub:
         self.awaiting_room_header: bool = True
         self.llm_quiet: bool = False
         self.llm_trace: bool = False
-        self.last_move_dir: Optional[str] = None
-        self.map_path: Path = Path("mudmap.json")
-        self.map_data: Dict = {"rooms": {}}
-        self.directions = {"n", "s", "e", "w", "u", "d", "ne", "nw", "se", "sw",
-                           "north", "south", "east", "west", "up", "down", "in", "out"}
-        self.dir_aliases = {
-            "north": "n", "south": "s", "east": "e", "west": "w",
-            "up": "u", "down": "d",
-            "northeast": "ne", "northwest": "nw",
-            "southeast": "se", "southwest": "sw",
-            "in": "in", "out": "out"
-        }
         
         self.running = False
         
         # Load MUD list
         self.load_mudlist()
-
-        if self.mapping_enabled:
-            self.load_map()
         
         # Initialize LLM model
         try:
@@ -143,44 +135,6 @@ class MUDHub:
                 f.write(f"[{ts}] {line}\n")
         except Exception as e:
             print(f"[HUB] Failed to write to bambu.log: {e}", file=sys.stderr)
-
-    # --- Mapping helpers ---
-    def load_map(self):
-        """Load existing mudmap.json if present."""
-        try:
-            if self.map_path.exists():
-                self.map_data = json.loads(self.map_path.read_text())
-                if "rooms" not in self.map_data:
-                    self.map_data = {"rooms": {}}
-        except Exception as e:
-            print(f"[HUB] Warning: could not load mudmap.json: {e}", file=sys.stderr)
-            self.map_data = {"rooms": {}}
-
-    def save_map(self):
-        """Persist map to mudmap.json (best-effort)."""
-        try:
-            self.map_path.write_text(json.dumps(self.map_data, indent=2, sort_keys=True))
-        except Exception as e:
-            print(f"[HUB] Warning: could not save mudmap.json: {e}", file=sys.stderr)
-
-    def record_transition(self, origin: str, direction: str, dest: str):
-        """Record a directional edge between rooms."""
-        rooms = self.map_data.setdefault("rooms", {})
-        origin_entry = rooms.setdefault(origin, {"exits": {}})
-        dest_entry = rooms.setdefault(dest, {"exits": {}})
-        origin_entry["exits"][direction] = dest
-        rooms[origin] = origin_entry
-        rooms[dest] = dest_entry
-        self.save_map()
-
-    def register_move_command(self, message: str):
-        """Track the last movement command to build the map."""
-        cmd = message.strip().lower()
-        if cmd in self.directions:
-            self.last_move_dir = self.dir_aliases.get(cmd, cmd)
-        else:
-            # Clear so non-movement doesn't get mapped
-            self.last_move_dir = None
 
     def log_session_start(self):
         """Log a session boundary to bambu.log."""
@@ -271,8 +225,8 @@ class MUDHub:
                         self.log_transcript(f"[USER->LLM] {line}")
                         await self.llm_query(line)
                     else:
-                        if self.mapping_enabled:
-                            self.register_move_command(line)
+                        if self.mapper:
+                            self.mapper.register_move_command(line)
                         await self.send_to_mud(line)
                         self.log_transcript(f"[USER->MUD] {line}")
                     
@@ -498,9 +452,8 @@ User input routing:
                 if room_name and room_name != self.current_location:
                     prev_location = self.current_location
                     self.current_location = room_name
-                    if self.mapping_enabled and prev_location and self.last_move_dir:
-                        self.record_transition(prev_location, self.last_move_dir, room_name)
-                    self.last_move_dir = None
+                    if self.mapper:
+                        self.mapper.handle_location_change(prev_location, room_name)
                     self.append_to_bambu(f"[location]{room_name}")
                     if not self.llm_quiet:
                         self.schedule_location_llm(room_name)
