@@ -8,6 +8,7 @@ import asyncio
 import sys
 import os
 import csv
+import argparse
 from datetime import datetime
 from typing import Optional, List, Dict
 from collections import deque
@@ -51,6 +52,7 @@ class MUDHub:
         self.awaiting_room_header: bool = True
         self.llm_quiet: bool = False
         self.llm_trace: bool = False
+        self.llm_auto: bool = False
         
         self.running = False
         
@@ -279,10 +281,16 @@ class MUDHub:
             elif state == 'trace off':
                 self.llm_trace = False
                 print("[HUB] LLM trace disabled")
+            elif state == 'auto on':
+                self.llm_auto = True
+                print("[HUB] LLM auto-execute enabled (proposals execute automatically)")
+            elif state == 'auto off':
+                self.llm_auto = False
+                print("[HUB] LLM auto-execute disabled (proposals require approval)")
             elif state == 'info':
                 self.show_llm_info()
             else:
-                print("[HUB] Usage: [llm on|off|quiet on|quiet off|trace on|trace off|info]", file=sys.stderr)
+                print("[HUB] Usage: [llm on|off|quiet on|quiet off|trace on|trace off|auto on|auto off|info]", file=sys.stderr)
         
         elif command in ('[quit]', '[q]', '[exit]'):
             print("[HUB] Shutting down...")
@@ -303,7 +311,7 @@ class MUDHub:
   [reject all]   - Discard all proposals
   [note <text>]  - Append <text> to bambu.log
   [dial <name>]  - Connect to MUD from mudlist.csv
-  [llm on|off|quiet on|quiet off|trace on|trace off|info] - Toggle LLM observation, quiet (auto room triggers), trace, or show LLM info
+  [llm on|off|quiet on|quiet off|trace on|trace off|auto on|auto off|info] - Toggle LLM settings
   [quit]         - Exit the hub (also: [q], [exit])
   
 User input routing:
@@ -385,7 +393,7 @@ User input routing:
     def show_llm_info(self):
         """Display LLM model and status information."""
         model_obj = type(self.model).__name__ if self.model else "None"
-        info_line = f"LLM Info | model={self.llm_model} loaded={self.model is not None} enabled={self.llm_enabled} quiet={self.llm_quiet} trace={self.llm_trace} pending={len(self.proposals)} obj={model_obj}"
+        info_line = f"LLM Info | model={self.llm_model} loaded={self.model is not None} enabled={self.llm_enabled} quiet={self.llm_quiet} trace={self.llm_trace} auto={self.llm_auto} pending={len(self.proposals)} obj={model_obj}"
         print(f"[HUB] {info_line}")
         self.append_to_bambu(info_line)
 
@@ -542,12 +550,12 @@ Only suggest MUD commands, never execute them directly."""
             )
             
             # Parse the response
-            self.parse_llm_response(response)
+            await self.parse_llm_response(response)
             
         except Exception as e:
             print(f"[HUB] LLM error: {e}", file=sys.stderr)
     
-    def parse_llm_response(self, response: str):
+    async def parse_llm_response(self, response: str):
         """Parse LLM response and extract proposals."""
         lines = response.split('\n')
         existing = {p.text.strip().lower() for p in self.proposals.values()}
@@ -570,7 +578,15 @@ Only suggest MUD commands, never execute them directly."""
                 existing.add(norm)
                 proposal = Proposal(text)
                 self.proposals[proposal.id] = proposal
-                print(f"[HUB] New proposal {proposal}")
+                
+                if self.llm_auto:
+                    # Auto-execute the proposal
+                    await self.send_to_mud(proposal.text)
+                    self.log_transcript(f"[LLM->MUD] {proposal.text}")
+                    print(f"[HUB] Auto-executed {proposal}")
+                    del self.proposals[proposal.id]
+                else:
+                    print(f"[HUB] New proposal {proposal}")
             elif line.startswith('NOTE:'):
                 note = line[5:].strip()
                 if not self.llm_quiet:
@@ -621,22 +637,28 @@ Only suggest MUD commands, never execute them directly."""
 
 def main():
     """Entry point."""
+    parser = argparse.ArgumentParser(description='Mudlark - MUD/LLM Hub')
+    parser.add_argument('host', nargs='?', help='MUD host or @mudname')
+    parser.add_argument('port', nargs='?', type=int, help='MUD port')
+    parser.add_argument('--local', action='store_true', help='Start in local mode (LLM only)')
+    parser.add_argument('--llm_model', default='gpt-4o-mini', help='LLM model to use (default: gpt-4o-mini)')
+    
+    args = parser.parse_args()
+    
     # Check for --local flag
-    if '--local' in sys.argv:
-        hub = MUDHub(local_mode=True)
+    if args.local:
+        hub = MUDHub(local_mode=True, llm_model=args.llm_model)
         asyncio.run(hub.run())
         return
     
-    if len(sys.argv) < 2:
-        print("Usage: uv run main.py @<mud_name>")
-        print("   or: uv run main.py <mud_host> <mud_port>")
-        print("   or: uv run main.py --local")
+    if not args.host:
+        parser.print_help()
         sys.exit(1)
     
     # Check if first argument is @mudname format
-    if sys.argv[1].startswith('@'):
-        mud_name = sys.argv[1][1:]  # Remove @ prefix
-        hub = MUDHub(local_mode=True)  # Start in local mode
+    if args.host.startswith('@'):
+        mud_name = args.host[1:]  # Remove @ prefix
+        hub = MUDHub(local_mode=True, llm_model=args.llm_model)  # Start in local mode
         # Load the mudlist to validate
         if mud_name not in hub.mudlist:
             print(f"Error: MUD '{mud_name}' not found in mudlist.csv")
@@ -649,20 +671,12 @@ def main():
         asyncio.run(hub.run())
         return
     
-    if len(sys.argv) < 3:
-        print("Usage: uv run main.py @<mud_name>")
-        print("   or: uv run main.py <mud_host> <mud_port>")
-        print("   or: uv run main.py --local")
+    if not args.port:
+        print("Error: Port required when not using @mudname format")
+        parser.print_help()
         sys.exit(1)
     
-    mud_host = sys.argv[1]
-    try:
-        mud_port = int(sys.argv[2])
-    except ValueError:
-        print("Error: Port must be a number")
-        sys.exit(1)
-    
-    hub = MUDHub(mud_host, mud_port)
+    hub = MUDHub(args.host, args.port, llm_model=args.llm_model)
     asyncio.run(hub.run())
 
 
